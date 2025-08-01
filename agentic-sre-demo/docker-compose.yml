@@ -1,57 +1,111 @@
 version: '3.8'
 
 services:
+  # SRE Agent Core Service
   sre-agent:
     build: .
+    container_name: sre-agent-core
     ports:
-      - "8000:8000"
+      - "8000:8000"  # FastAPI API
+      - "8501:8501"  # Streamlit Dashboard
     environment:
-      - ENVIRONMENT=stage
-      - MODEL_NAME=gpt-4o
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - LOG_LEVEL=INFO
+      - JWT_SECRET=${JWT_SECRET:-your-secret-key}
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://postgres:postgres@postgres:5432/sre_agent_db
+      - OTLP_ENDPOINT=http://otel-collector:4317
+      - LANGFUSE_ENDPOINT=http://langfuse:3000
+      - MODEL_URL=http://ollama:11434
+      - MTLS_CERT_PATH=/certs/client.crt
+      - MTLS_KEY_PATH=/certs/client.key
     volumes:
+      - ./certs:/certs:ro
       - ./data:/app/data
-      - ./logs:/app/logs
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+    depends_on:
+      - redis
+      - postgres
+      - ollama
+      - otel-collector
     networks:
       - sre-network
+    restart: unless-stopped
 
-  # Optional: Redis for caching and session storage
+  # Redis for caching and session management
   redis:
     image: redis:7-alpine
+    container_name: sre-redis
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    restart: unless-stopped
     networks:
       - sre-network
+    restart: unless-stopped
 
-  # Optional: PostgreSQL for persistent storage
+  # PostgreSQL for persistent storage
   postgres:
     image: postgres:15-alpine
+    container_name: sre-postgres
     environment:
-      POSTGRES_DB: sre_agent
-      POSTGRES_USER: sre_user
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sre_password}
+      - POSTGRES_DB=sre_agent_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - sre-network
+    restart: unless-stopped
 
-  # Optional: Prometheus for monitoring the SRE agent itself
+  # Ollama for local LLM inference
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sre-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - sre-network
+    restart: unless-stopped
+
+  # OpenTelemetry Collector for observability
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    container_name: sre-otel-collector
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics
+      - "8889:8889"   # Prometheus exporter
+    volumes:
+      - ./otel-collector-config.yml:/etc/otel-collector-config.yml
+    command: ["--config", "/etc/otel-collector-config.yml"]
+    networks:
+      - sre-network
+    restart: unless-stopped
+
+  # LangFuse for LLM observability
+  langfuse:
+    image: langfuse/langfuse:latest
+    container_name: sre-langfuse
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/langfuse
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-your-secret-key}
+      - NEXTAUTH_URL=http://localhost:3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+    networks:
+      - sre-network
+    restart: unless-stopped
+
+  # Prometheus for metrics collection
   prometheus:
     image: prom/prometheus:latest
+    container_name: sre-prometheus
     ports:
       - "9090:9090"
     volumes:
@@ -64,28 +118,33 @@ services:
       - '--web.console.templates=/etc/prometheus/consoles'
       - '--storage.tsdb.retention.time=200h'
       - '--web.enable-lifecycle'
-    restart: unless-stopped
     networks:
       - sre-network
+    restart: unless-stopped
 
-  # Optional: Grafana for visualization
+  # Grafana for visualization
   grafana:
     image: grafana/grafana:latest
-    ports:
-      - "3000:3000"
+    container_name: sre-grafana
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3001:3000"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
       - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
-    restart: unless-stopped
+    depends_on:
+      - prometheus
     networks:
       - sre-network
+    restart: unless-stopped
 
-  # Optional: Elasticsearch for local testing (if needed)
+  # Elasticsearch for log aggregation
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: sre-elasticsearch
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
@@ -94,30 +153,64 @@ services:
       - "9200:9200"
     volumes:
       - elasticsearch_data:/usr/share/elasticsearch/data
-    restart: unless-stopped
     networks:
       - sre-network
+    restart: unless-stopped
 
-  # Optional: Kibana for Elasticsearch visualization
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.11.0
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: sre-jaeger
     environment:
-      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      - COLLECTOR_OTLP_ENABLED=true
     ports:
-      - "5601:5601"
-    depends_on:
-      - elasticsearch
-    restart: unless-stopped
+      - "16686:16686"  # UI
+      - "14268:14268"  # HTTP
+      - "14250:14250"  # gRPC
     networks:
       - sre-network
+    restart: unless-stopped
+
+  # Nagios for infrastructure monitoring
+  nagios:
+    image: jasonrivers/nagios:latest
+    container_name: sre-nagios
+    environment:
+      - NAGIOSADMIN_PASS=nagios
+    ports:
+      - "8080:80"
+    volumes:
+      - nagios_data:/opt/nagios/etc
+      - nagios_logs:/opt/nagios/var
+    networks:
+      - sre-network
+    restart: unless-stopped
+
+  # Vanguard for security events (mock)
+  vanguard:
+    image: nginx:alpine
+    container_name: sre-vanguard
+    ports:
+      - "8081:80"
+    volumes:
+      - ./monitoring/vanguard:/usr/share/nginx/html
+    networks:
+      - sre-network
+    restart: unless-stopped
 
 volumes:
   redis_data:
   postgres_data:
+  ollama_data:
   prometheus_data:
   grafana_data:
   elasticsearch_data:
+  nagios_data:
+  nagios_logs:
 
 networks:
   sre-network:
-    driver: bridge 
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16 

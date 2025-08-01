@@ -1,30 +1,54 @@
+#!/usr/bin/env python3
 """
-FastAPI web interface for the Production-Level SRE AI Agent
-
-This API provides endpoints for interacting with the SRE agent that follows
-the full architecture with LangGraph Flow, reasoning capabilities, observability
-adapters, insight cache, and action policies.
+SRE Agent REST API - Final Architecture Implementation
+Based on the comprehensive architecture with JWT auth, mTLS, and OTLP traces
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional, Dict, Any, List
 import uvicorn
-from datetime import datetime
-from typing import Dict, List, Optional, Any
-import asyncio
+import jwt
+import ssl
 import logging
+from datetime import datetime, timedelta
+import os
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-from sre_agent import SREAgent, SREConfig, ActionType
+# Import the updated SRE agent
+from sre_agent import get_sre_agent, SREAgentCore
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Initialize OpenTelemetry tracing
+trace.set_tracer_provider(
+    TracerProvider(
+        resource=Resource.create({"service.name": "sre-agent-api"})
+    )
+)
+otlp_exporter = OTLPSpanExporter(endpoint="http://localhost:4317")
+trace.get_tracer_provider().add_span_processor(
+    BatchSpanProcessor(otlp_exporter)
+)
+tracer = trace.get_tracer(__name__)
+
+# Initialize FastAPI app
 app = FastAPI(
     title="SRE AI Agent API",
-    description="Production-level SRE AI Agent with full architecture compliance",
-    version="2.0.0"
+    description="REST API for SRE AI Agent with final architecture",
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 # Add CORS middleware
@@ -36,428 +60,461 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Instrument FastAPI with OpenTelemetry
+FastAPIInstrumentor.instrument_app(app)
+
+# Security configuration
+JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Security schemas
+security = HTTPBearer()
+
+# Pydantic models
+class ChatRequest(BaseModel):
+    message: str
+    context: Optional[Dict[str, Any]] = None
+    user_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    trace_id: str
+    span_id: str
+    model_used: str
+    timestamp: str
+
+class HealthResponse(BaseModel):
+    status: str
+    components: Dict[str, bool]
+    timestamp: str
+    trace_id: str
+
+class IncidentRequest(BaseModel):
+    incident_id: str
+    description: Optional[str] = None
+
+class AlertRequest(BaseModel):
+    severity: Optional[str] = None
+    service: Optional[str] = None
+
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str
+    expires_in: int
+
+# JWT token management
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+    """Verify JWT token"""
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.JWTError:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+# Mock user database (in production, use real database)
+USERS_DB = {
+    "admin": {
+        "username": "admin",
+        "password": "admin123",  # In production, use hashed passwords
+        "permissions": ["read", "write", "incident", "alert", "action", "metrics", "performance"]
+    },
+    "sre_engineer": {
+        "username": "sre_engineer",
+        "password": "sre123",
+        "permissions": ["read", "incident", "alert", "metrics", "performance"]
+    },
+    "viewer": {
+        "username": "viewer",
+        "password": "view123",
+        "permissions": ["read"]
+    }
+}
+
 # Global SRE agent instance
-sre_agent: Optional[SREAgent] = None
-
-# Pydantic models for API requests and responses
-class HealthCheckRequest(BaseModel):
-    include_architecture_status: bool = Field(default=True, description="Include architecture component status")
-
-class IncidentInvestigationRequest(BaseModel):
-    incident_description: str = Field(..., description="Description of the incident to investigate")
-    priority: str = Field(default="medium", description="Incident priority (low, medium, high, critical)")
-    auto_remediation: bool = Field(default=True, description="Enable automated remediation actions")
-
-class AlertMonitoringRequest(BaseModel):
-    include_correlation: bool = Field(default=True, description="Include correlation analysis")
-    auto_response: bool = Field(default=True, description="Enable automated responses")
-
-class TrendAnalysisRequest(BaseModel):
-    metric: str = Field(..., description="Metric to analyze")
-    timeframe: str = Field(default="7d", description="Timeframe for analysis")
-    include_forecasting: bool = Field(default=True, description="Include trend forecasting")
-
-class RemediationRequest(BaseModel):
-    issue_description: str = Field(..., description="Description of the issue")
-    include_automated_actions: bool = Field(default=True, description="Include automated action suggestions")
-
-class IncidentReportRequest(BaseModel):
-    incident_id: str = Field(..., description="Incident ID")
-    timeframe: str = Field(default="24h", description="Timeframe for the report")
-    include_lessons_learned: bool = Field(default=True, description="Include lessons learned section")
-
-class AutomatedActionRequest(BaseModel):
-    action_type: str = Field(..., description="Type of action to execute")
-    parameters: Dict[str, Any] = Field(default={}, description="Action parameters")
-    confidence_threshold: float = Field(default=0.8, description="Confidence threshold for execution")
-
-class ConfigurationRequest(BaseModel):
-    environment: str = Field(default="stage", description="Environment (dev, stage, prod)")
-    model_name: str = Field(default="llama3.1:8b", description="LLM model to use (local Llama3)")
-    model_url: str = Field(default="http://localhost:11434", description="Ollama server URL")
-    reasoning_enabled: bool = Field(default=True, description="Enable reasoning capabilities")
-    auto_remediation_enabled: bool = Field(default=True, description="Enable automated remediation")
-    reasoning_min_steps: int = Field(default=3, description="Minimum reasoning steps")
-    reasoning_max_steps: int = Field(default=10, description="Maximum reasoning steps")
-
-class HealthCheckResponse(BaseModel):
-    status: str
-    timestamp: str
-    environment: str
-    architecture_status: Optional[Dict[str, Any]] = None
-    health_score: Optional[int] = None
-    issues: Optional[List[str]] = None
-
-class InvestigationResponse(BaseModel):
-    incident_id: str
-    timestamp: str
-    status: str
-    findings: Dict[str, Any]
-    recommendations: List[str]
-    evidence: Dict[str, Any]
-    architecture_compliant: bool = True
-
-class AlertMonitoringResponse(BaseModel):
-    timestamp: str
-    alerts_count: int
-    critical_alerts: int
-    warnings: int
-    recommendations: List[str]
-    architecture_compliant: bool = True
-
-class TrendAnalysisResponse(BaseModel):
-    metric: str
-    timeframe: str
-    timestamp: str
-    trend_direction: str
-    forecast: Optional[Dict[str, Any]] = None
-    recommendations: List[str]
-    architecture_compliant: bool = True
-
-class RemediationResponse(BaseModel):
-    issue: str
-    timestamp: str
-    remediation_plan: List[str]
-    automated_actions: List[Dict[str, Any]]
-    risk_assessment: Dict[str, Any]
-    architecture_compliant: bool = True
-
-class IncidentReportResponse(BaseModel):
-    incident_id: str
-    timestamp: str
-    timeframe: str
-    executive_summary: str
-    technical_details: Dict[str, Any]
-    lessons_learned: List[str]
-    action_items: List[str]
-    architecture_compliant: bool = True
-
-class AutomatedActionResponse(BaseModel):
-    action_type: str
-    success: bool
-    result: Dict[str, Any]
-    timestamp: str
-    confidence: float
-
-class ConfigurationResponse(BaseModel):
-    environment: str
-    model_name: str
-    model_url: str
-    reasoning_enabled: bool
-    auto_remediation_enabled: bool
-    architecture_status: Dict[str, Any]
-
-class MetricsResponse(BaseModel):
-    timestamp: str
-    total_requests: int
-    successful_requests: int
-    failed_requests: int
-    average_response_time: float
-    architecture_components: Dict[str, str]
-
-# Background task for continuous monitoring
-async def background_monitoring():
-    """Background task for continuous system monitoring"""
-    while True:
-        try:
-            if sre_agent:
-                logger.info("Running background monitoring...")
-                await sre_agent.monitor_alerts()
-            await asyncio.sleep(300)  # Run every 5 minutes
-        except Exception as e:
-            logger.error(f"Background monitoring failed: {e}")
-            await asyncio.sleep(60)  # Wait 1 minute before retrying
+sre_agent: Optional[SREAgentCore] = None
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize the SRE agent on startup"""
     global sre_agent
     try:
-        logger.info("Initializing SRE Agent...")
-        
-        # Initialize configuration from environment variables
-        config = SREConfig(
-            environment="stage",  # Can be overridden by environment variable
-            model_name="llama3.1:8b",  # Using local Llama3 model
-            model_url="http://localhost:11434",  # Ollama server URL
-            reasoning_enabled=True,
-            auto_remediation_enabled=True
-        )
-        
-        # Create and initialize the SRE agent
-        sre_agent = SREAgent(config)
-        await sre_agent.initialize()
-        
+        sre_agent = get_sre_agent()
         logger.info("SRE Agent initialized successfully")
-        
-        # Start background monitoring
-        asyncio.create_task(background_monitoring())
-        
     except Exception as e:
         logger.error(f"Failed to initialize SRE Agent: {e}")
         raise
 
-@app.get("/health", response_model=HealthCheckResponse)
-async def health_check():
-    """Basic health check endpoint"""
-    return HealthCheckResponse(
-        status="healthy",
-        timestamp=datetime.now().isoformat(),
-        environment="stage"
-    )
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    global sre_agent
+    if sre_agent:
+        sre_agent.cleanup()
+        logger.info("SRE Agent cleaned up")
 
-@app.post("/api/health-check", response_model=HealthCheckResponse)
-async def perform_health_check(request: HealthCheckRequest):
-    """Perform comprehensive system health check"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        result = await sre_agent.health_check()
+# Authentication endpoints
+@app.post("/auth/login", response_model=AuthResponse)
+async def login(auth_request: AuthRequest):
+    """Login endpoint with JWT token generation"""
+    with tracer.start_as_current_span("login") as span:
+        span.set_attribute("username", auth_request.username)
         
-        # Get architecture status if requested
-        architecture_status = None
-        if request.include_architecture_status:
-            architecture_status = await sre_agent.get_architecture_status()
+        user = USERS_DB.get(auth_request.username)
+        if not user or user["password"] != auth_request.password:
+            span.set_attribute("login_success", False)
+            raise HTTPException(status_code=401, detail="Invalid credentials")
         
-        return HealthCheckResponse(
-            status="healthy",
-            timestamp=result["timestamp"],
-            environment=result["environment"],
-            architecture_status=architecture_status,
-            health_score=85,  # Mock score
-            issues=[]  # Mock issues
+        # Create access token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user["username"], "permissions": user["permissions"]},
+            expires_delta=access_token_expires
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
-
-@app.post("/api/investigate", response_model=InvestigationResponse)
-async def investigate_incident(request: IncidentInvestigationRequest):
-    """Investigate a specific incident"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        result = await sre_agent.investigate_incident(request.incident_description)
-        incident_id = f"incident_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        return InvestigationResponse(
-            incident_id=incident_id,
-            timestamp=result["timestamp"],
-            status="investigating",
-            findings=result.get("workflow_result", {}),
-            recommendations=[],
-            evidence={},
-            architecture_compliant=result.get("architecture_compliant", True)
+        span.set_attribute("login_success", True)
+        span.set_attribute("user_permissions", str(user["permissions"]))
+        
+        return AuthResponse(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Investigation failed: {str(e)}")
 
-@app.post("/api/alerts/monitor", response_model=AlertMonitoringResponse)
-async def monitor_alerts(request: AlertMonitoringRequest):
-    """Monitor for new alerts"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        result = await sre_agent.monitor_alerts()
+@app.post("/auth/verify")
+async def verify_auth(token_data: Dict[str, Any] = Depends(verify_token)):
+    """Verify authentication token"""
+    with tracer.start_as_current_span("verify_auth") as span:
+        span.set_attribute("user_id", token_data.get("sub", "unknown"))
+        span.set_attribute("permissions", str(token_data.get("permissions", [])))
         
-        return AlertMonitoringResponse(
-            timestamp=result["timestamp"],
-            alerts_count=5,  # Mock data
-            critical_alerts=1,
-            warnings=4,
-            recommendations=["Scale up service instances", "Check database connections"],
-            architecture_compliant=result.get("architecture_compliant", True)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Alert monitoring failed: {str(e)}")
-
-@app.post("/api/trends/analyze", response_model=TrendAnalysisResponse)
-async def analyze_trends(request: TrendAnalysisRequest):
-    """Analyze trends for specific metrics"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        result = await sre_agent.analyze_trends(request.metric, request.timeframe)
-        
-        return TrendAnalysisResponse(
-            metric=request.metric,
-            timeframe=request.timeframe,
-            timestamp=result["timestamp"],
-            trend_direction="increasing",
-            forecast={"next_24h": "85%", "next_7d": "92%"} if request.include_forecasting else None,
-            recommendations=["Monitor closely", "Consider scaling"],
-            architecture_compliant=result.get("architecture_compliant", True)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Trend analysis failed: {str(e)}")
-
-@app.post("/api/remediation/suggest", response_model=RemediationResponse)
-async def suggest_remediation(request: RemediationRequest):
-    """Suggest remediation actions"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        result = await sre_agent.suggest_remediation(request.issue_description)
-        
-        return RemediationResponse(
-            issue=request.issue_description,
-            timestamp=result["timestamp"],
-            remediation_plan=["Restart service", "Scale resources", "Update configuration"],
-            automated_actions=[{"action": "restart_service", "confidence": 0.9}] if request.include_automated_actions else [],
-            risk_assessment={"risk_level": "medium", "rollback_plan": "available"},
-            architecture_compliant=result.get("architecture_compliant", True)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Remediation suggestion failed: {str(e)}")
-
-@app.post("/api/reports/generate", response_model=IncidentReportResponse)
-async def generate_incident_report(request: IncidentReportRequest):
-    """Generate incident report"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        result = await sre_agent.generate_incident_report(request.incident_id, request.timeframe)
-        
-        return IncidentReportResponse(
-            incident_id=request.incident_id,
-            timestamp=result["timestamp"],
-            timeframe=request.timeframe,
-            executive_summary="Service degradation resolved within 2 hours",
-            technical_details={"root_cause": "Database connection pool exhaustion", "resolution": "Connection pool scaling"},
-            lessons_learned=["Monitor connection pools", "Set up early warnings"] if request.include_lessons_learned else [],
-            action_items=["Update monitoring", "Implement auto-scaling"],
-            architecture_compliant=result.get("architecture_compliant", True)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
-
-@app.post("/api/actions/execute", response_model=AutomatedActionResponse)
-async def execute_automated_action(request: AutomatedActionRequest):
-    """Execute an automated action"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        # Convert string action type to enum
-        try:
-            action_type = ActionType(request.action_type)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid action type: {request.action_type}")
-        
-        result = await sre_agent.execute_automated_action(action_type, request.parameters)
-        
-        return AutomatedActionResponse(
-            action_type=request.action_type,
-            success=result.get("success", False),
-            result=result,
-            timestamp=datetime.now().isoformat(),
-            confidence=request.confidence_threshold
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Action execution failed: {str(e)}")
-
-@app.get("/api/config", response_model=ConfigurationResponse)
-async def get_configuration():
-    """Get current configuration"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        architecture_status = await sre_agent.get_architecture_status()
-        
-        return ConfigurationResponse(
-            environment=sre_agent.config.environment,
-            model_name=sre_agent.config.model_name,
-            model_url=sre_agent.config.model_url,
-            reasoning_enabled=sre_agent.config.reasoning_enabled,
-            auto_remediation_enabled=sre_agent.config.auto_remediation_enabled,
-            architecture_status=architecture_status
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Configuration retrieval failed: {str(e)}")
-
-@app.post("/api/config", response_model=ConfigurationResponse)
-async def update_configuration(request: ConfigurationRequest):
-    """Update configuration"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        # Update configuration
-        sre_agent.config.environment = request.environment
-        sre_agent.config.model_name = request.model_name
-        sre_agent.config.model_url = request.model_url
-        sre_agent.config.reasoning_enabled = request.reasoning_enabled
-        sre_agent.config.auto_remediation_enabled = request.auto_remediation_enabled
-        sre_agent.config.reasoning_min_steps = request.reasoning_min_steps
-        sre_agent.config.reasoning_max_steps = request.reasoning_max_steps
-        
-        # Reinitialize agent with new configuration
-        await sre_agent.initialize()
-        
-        architecture_status = await sre_agent.get_architecture_status()
-        
-        return ConfigurationResponse(
-            environment=request.environment,
-            model_name=request.model_name,
-            model_url=request.model_url,
-            reasoning_enabled=request.reasoning_enabled,
-            auto_remediation_enabled=request.auto_remediation_enabled,
-            architecture_status=architecture_status
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Configuration update failed: {str(e)}")
-
-@app.get("/api/metrics", response_model=MetricsResponse)
-async def get_metrics():
-    """Get system metrics"""
-    return MetricsResponse(
-        timestamp=datetime.now().isoformat(),
-        total_requests=1000,
-        successful_requests=950,
-        failed_requests=50,
-        average_response_time=1.2,
-        architecture_components={
-            "langgraph_flow": "active",
-            "llm_reasoning_core": "active",
-            "observability_adapter": "active",
-            "insight_cache": "active",
-            "action_policies": "active"
+        return {
+            "valid": True,
+            "user_id": token_data.get("sub"),
+            "permissions": token_data.get("permissions", []),
+            "expires_at": token_data.get("exp")
         }
-    )
 
-@app.get("/api/architecture/status")
-async def get_architecture_status():
-    """Get detailed architecture component status"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        return await sre_agent.get_architecture_status()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Architecture status retrieval failed: {str(e)}")
+# Health check endpoint
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """System health check with comprehensive component status"""
+    with tracer.start_as_current_span("api_health_check") as span:
+        try:
+            if not sre_agent:
+                raise HTTPException(status_code=503, detail="SRE Agent not initialized")
+            
+            health_result = await sre_agent.health_check()
+            
+            span.set_attribute("health_status", health_result.get("status", "unknown"))
+            span.set_attribute("components_healthy", str(health_result.get("components", {})))
+            
+            return HealthResponse(
+                status=health_result.get("status", "unknown"),
+                components=health_result.get("components", {}),
+                timestamp=health_result.get("timestamp", datetime.utcnow().isoformat()),
+                trace_id=health_result.get("trace_id", span.get_span_context().trace_id)
+            )
+            
+        except Exception as e:
+            span.record_exception(e)
+            raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
-@app.get("/api/insights/{insight_type}")
-async def get_insight(insight_type: str):
-    """Get cached insights"""
-    if not sre_agent:
-        raise HTTPException(status_code=503, detail="SRE Agent not initialized")
-    
-    try:
-        insight = await sre_agent.insight_cache.get_insight(insight_type)
-        if insight:
-            return {"insight_type": insight_type, "data": insight}
-        else:
-            raise HTTPException(status_code=404, detail=f"No insight found for type: {insight_type}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Insight retrieval failed: {str(e)}")
+# Chat endpoint with JWT authentication
+@app.post("/chat", response_model=ChatResponse)
+async def chat_with_agent(
+    request: ChatRequest,
+    token_data: Dict[str, Any] = Depends(verify_token)
+):
+    """Chat with the SRE agent using natural language"""
+    with tracer.start_as_current_span("chat_with_agent") as span:
+        span.set_attribute("user_id", token_data.get("sub", "unknown"))
+        span.set_attribute("message_length", len(request.message))
+        
+        try:
+            if not sre_agent:
+                raise HTTPException(status_code=503, detail="SRE Agent not initialized")
+            
+            # Create JWT token for agent authentication
+            jwt_token = create_access_token(
+                data={"sub": token_data.get("sub"), "permissions": token_data.get("permissions", [])}
+            )
+            
+            # Process request with agent
+            result = await sre_agent.process_request(request.message, jwt_token)
+            
+            if "error" in result:
+                span.set_attribute("chat_success", False)
+                span.set_attribute("error", result["error"])
+                raise HTTPException(status_code=400, detail=result["error"])
+            
+            span.set_attribute("chat_success", True)
+            span.set_attribute("model_used", result.get("model_used", "unknown"))
+            
+            return ChatResponse(
+                response=result["response"],
+                trace_id=result["trace_id"],
+                span_id=result["span_id"],
+                model_used=result.get("model_used", "primary"),
+                timestamp=datetime.utcnow().isoformat()
+            )
+            
+        except Exception as e:
+            span.record_exception(e)
+            raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+# Incident investigation endpoint
+@app.post("/incidents/investigate")
+async def investigate_incident(
+    request: IncidentRequest,
+    token_data: Dict[str, Any] = Depends(verify_token)
+):
+    """Investigate a specific incident"""
+    with tracer.start_as_current_span("investigate_incident") as span:
+        span.set_attribute("incident_id", request.incident_id)
+        span.set_attribute("user_id", token_data.get("sub", "unknown"))
+        
+        try:
+            if not sre_agent:
+                raise HTTPException(status_code=503, detail="SRE Agent not initialized")
+            
+            # Check permissions
+            if "incident" not in token_data.get("permissions", []):
+                raise HTTPException(status_code=403, detail="Insufficient permissions for incident investigation")
+            
+            # Create JWT token for agent authentication
+            jwt_token = create_access_token(
+                data={"sub": token_data.get("sub"), "permissions": token_data.get("permissions", [])}
+            )
+            
+            result = await sre_agent.investigate_incident(request.incident_id, jwt_token)
+            
+            if "error" in result:
+                span.set_attribute("investigation_success", False)
+                span.set_attribute("error", result["error"])
+                raise HTTPException(status_code=400, detail=result["error"])
+            
+            span.set_attribute("investigation_success", True)
+            
+            return {
+                "incident_id": request.incident_id,
+                "analysis": result.get("analysis", ""),
+                "recommendations": result.get("recommendations", []),
+                "trace_id": result.get("trace_id", span.get_span_context().trace_id),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            span.record_exception(e)
+            raise HTTPException(status_code=500, detail=f"Incident investigation failed: {str(e)}")
+
+# Alert monitoring endpoint
+@app.get("/alerts/monitor")
+async def monitor_alerts(
+    severity: Optional[str] = None,
+    token_data: Dict[str, Any] = Depends(verify_token)
+):
+    """Monitor alerts with optional severity filtering"""
+    with tracer.start_as_current_span("monitor_alerts") as span:
+        span.set_attribute("severity_filter", severity or "all")
+        span.set_attribute("user_id", token_data.get("sub", "unknown"))
+        
+        try:
+            if not sre_agent:
+                raise HTTPException(status_code=503, detail="SRE Agent not initialized")
+            
+            # Check permissions
+            if "alert" not in token_data.get("permissions", []):
+                raise HTTPException(status_code=403, detail="Insufficient permissions for alert monitoring")
+            
+            # Create JWT token for agent authentication
+            jwt_token = create_access_token(
+                data={"sub": token_data.get("sub"), "permissions": token_data.get("permissions", [])}
+            )
+            
+            result = await sre_agent.monitor_alerts(severity)
+            
+            if "error" in result:
+                span.set_attribute("monitoring_success", False)
+                span.set_attribute("error", result["error"])
+                raise HTTPException(status_code=400, detail=result["error"])
+            
+            span.set_attribute("monitoring_success", True)
+            span.set_attribute("alerts_count", result.get("count", 0))
+            
+            return {
+                "alerts": result.get("alerts", []),
+                "analysis": result.get("analysis", ""),
+                "count": result.get("count", 0),
+                "trace_id": result.get("trace_id", span.get_span_context().trace_id),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            span.record_exception(e)
+            raise HTTPException(status_code=500, detail=f"Alert monitoring failed: {str(e)}")
+
+# System metrics endpoint
+@app.get("/metrics/system")
+async def get_system_metrics(
+    token_data: Dict[str, Any] = Depends(verify_token)
+):
+    """Get system metrics"""
+    with tracer.start_as_current_span("get_system_metrics") as span:
+        span.set_attribute("user_id", token_data.get("sub", "unknown"))
+        
+        try:
+            if not sre_agent:
+                raise HTTPException(status_code=503, detail="SRE Agent not initialized")
+            
+            # Check permissions
+            if "metrics" not in token_data.get("permissions", []):
+                raise HTTPException(status_code=403, detail="Insufficient permissions for system metrics")
+            
+            # Mock system metrics for now
+            metrics = {
+                "cpu_usage": 45.2,
+                "memory_usage": 67.8,
+                "disk_usage": 23.1,
+                "network_latency": 12.5,
+                "active_connections": 1250,
+                "error_rate": 0.02
+            }
+            
+            span.set_attribute("metrics_retrieved", True)
+            
+            return {
+                "metrics": metrics,
+                "timestamp": datetime.utcnow().isoformat(),
+                "trace_id": span.get_span_context().trace_id
+            }
+            
+        except Exception as e:
+            span.record_exception(e)
+            raise HTTPException(status_code=500, detail=f"Failed to get system metrics: {str(e)}")
+
+# Performance data endpoint
+@app.get("/performance/data")
+async def get_performance_data(
+    service: Optional[str] = None,
+    timeframe: Optional[str] = "1h",
+    token_data: Dict[str, Any] = Depends(verify_token)
+):
+    """Get performance data for services"""
+    with tracer.start_as_current_span("get_performance_data") as span:
+        span.set_attribute("service", service or "all")
+        span.set_attribute("timeframe", timeframe)
+        span.set_attribute("user_id", token_data.get("sub", "unknown"))
+        
+        try:
+            if not sre_agent:
+                raise HTTPException(status_code=503, detail="SRE Agent not initialized")
+            
+            # Check permissions
+            if "performance" not in token_data.get("permissions", []):
+                raise HTTPException(status_code=403, detail="Insufficient permissions for performance data")
+            
+            # Mock performance data
+            performance_data = {
+                "response_times": {
+                    "p50": 150,
+                    "p95": 450,
+                    "p99": 1200
+                },
+                "throughput": 1250,
+                "error_rate": 0.015,
+                "availability": 99.95
+            }
+            
+            span.set_attribute("performance_data_retrieved", True)
+            
+            return {
+                "service": service or "all",
+                "timeframe": timeframe,
+                "data": performance_data,
+                "timestamp": datetime.utcnow().isoformat(),
+                "trace_id": span.get_span_context().trace_id
+            }
+            
+        except Exception as e:
+            span.record_exception(e)
+            raise HTTPException(status_code=500, detail=f"Failed to get performance data: {str(e)}")
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "SRE AI Agent API - Final Architecture",
+        "version": "2.0.0",
+        "architecture": "LangGraph + JWT + mTLS + OTLP",
+        "endpoints": {
+            "health": "/health",
+            "chat": "/chat",
+            "auth": "/auth/login",
+            "incidents": "/incidents/investigate",
+            "alerts": "/alerts/monitor",
+            "metrics": "/metrics/system",
+            "performance": "/performance/data"
+        },
+        "documentation": "/docs"
+    }
+
+# Error handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with tracing"""
+    with tracer.start_as_current_span("http_exception") as span:
+        span.set_attribute("status_code", exc.status_code)
+        span.set_attribute("detail", exc.detail)
+        span.set_attribute("path", str(request.url))
+        
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": exc.detail,
+                "status_code": exc.status_code,
+                "timestamp": datetime.utcnow().isoformat(),
+                "trace_id": span.get_span_context().trace_id
+            }
+        )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle general exceptions with tracing"""
+    with tracer.start_as_current_span("general_exception") as span:
+        span.record_exception(exc)
+        span.set_attribute("path", str(request.url))
+        
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Internal server error",
+                "detail": str(exc),
+                "timestamp": datetime.utcnow().isoformat(),
+                "trace_id": span.get_span_context().trace_id
+            }
+        )
 
 if __name__ == "__main__":
+    # Run the API server
     uvicorn.run(
         "sre_agent_api:app",
         host="0.0.0.0",
