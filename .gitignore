@@ -108,6 +108,10 @@ console.log.*
 com.docker.backend.log.*
 init.log
 
+# Large files
+*.zip
+SRE-AI-Agent-Complete.zip
+
 # Agno framework (embedded repository)
 agentic-sre-demo/agno/
 
